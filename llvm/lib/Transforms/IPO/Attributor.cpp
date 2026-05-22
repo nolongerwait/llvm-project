@@ -1959,6 +1959,10 @@ bool Attributor::checkForAllCallSites(function_ref<bool(AbstractCallSite)> Pred,
 }
 
 ArrayRef<const Use *> Attributor::getPotentialCallSiteUses(const Function &Fn) {
+  assert(
+      (Phase == AttributorPhase::SEEDING || Phase == AttributorPhase::UPDATE) &&
+      "Cached potential call site uses are only valid before IR changes");
+
   std::unique_ptr<SmallVector<const Use *, 8>> &PotentialUsesPtr =
       PotentialCallSiteUsesMap[&Fn];
   if (PotentialUsesPtr)
@@ -2041,9 +2045,6 @@ bool Attributor::checkForAllCallSites(function_ref<bool(AbstractCallSite)> Pred,
           dbgs() << "[Attributor] Use, is constant cast expression, add "
                  << CE->getNumUses() << " uses of that expression instead!\n";
         });
-        assert((Phase != AttributorPhase::SEEDING &&
-                Phase != AttributorPhase::UPDATE) &&
-               "Constant expression uses should be expanded in the cache");
         for (const Use &CEU : CE->uses())
           Uses.push_back(&CEU);
         PotentialUses = Uses;
