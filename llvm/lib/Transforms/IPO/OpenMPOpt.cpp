@@ -5601,6 +5601,45 @@ void OpenMPOpt::registerAAsForFunction(Attributor &A, const Function &F) {
   if (F.hasFnAttribute(Attribute::Convergent))
     A.getOrCreateAAFor<AANonConvergent>(FPos);
 
+  if (A.isModulePass()) {
+    A.getOrCreateAAFor<AAIsDead>(FPos);
+    bool IsKnown;
+    if (!AA::hasAssumedIRAttr<Attribute::NoRecurse>(
+            A, nullptr, FPos, DepClassTy::NONE, IsKnown))
+      A.getOrCreateAAFor<AANoRecurse>(FPos);
+    const bool HasPointerArgument =
+        llvm::any_of(F.args(), [](const Argument &Arg) {
+          return Arg.getType()->isPointerTy();
+        });
+    if (HasPointerArgument) {
+      if (!AA::hasAssumedIRAttr<Attribute::NoSync>(
+              A, nullptr, FPos, DepClassTy::NONE, IsKnown))
+        A.getOrCreateAAFor<AANoSync>(FPos);
+      if (!AA::hasAssumedIRAttr<Attribute::NoUnwind>(
+              A, nullptr, FPos, DepClassTy::NONE, IsKnown))
+        A.getOrCreateAAFor<AANoUnwind>(FPos);
+      A.getOrCreateAAFor<AAMemoryBehavior>(FPos);
+    }
+
+    for (const Argument &Arg : F.args()) {
+      IRPosition ArgPos = IRPosition::argument(Arg);
+      if (!Arg.getType()->isPointerTy())
+        continue;
+      if (!llvm::any_of(Arg.uses(), [&](const Use &U) {
+            if (const auto *LI = dyn_cast<LoadInst>(U.getUser()))
+              return LI->getPointerOperand() == &Arg;
+            if (const auto *SI = dyn_cast<StoreInst>(U.getUser()))
+              return SI->getPointerOperand() == &Arg;
+            return false;
+          }))
+        continue;
+      if (!AA::hasAssumedIRAttr<Attribute::Captures>(
+              A, nullptr, ArgPos, DepClassTy::NONE, IsKnown))
+        A.getOrCreateAAFor<AANoCapture>(ArgPos);
+      A.getOrCreateAAFor<AAMemoryBehavior>(ArgPos);
+    }
+  }
+
   const bool FunctionUsesSharedAlloc =
       !DisableOpenMPOptDeglobalization &&
       OMPInfoCache.RFIs[OMPRTL___kmpc_alloc_shared].getUseVector(
