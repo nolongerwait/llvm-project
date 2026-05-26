@@ -2045,6 +2045,9 @@ bool Attributor::checkForAllCallSites(function_ref<bool(AbstractCallSite)> Pred,
           dbgs() << "[Attributor] Use, is constant cast expression, add "
                  << CE->getNumUses() << " uses of that expression instead!\n";
         });
+        assert((Phase != AttributorPhase::SEEDING &&
+                Phase != AttributorPhase::UPDATE) &&
+               "Constant expression uses should be expanded in the cache");
         for (const Use &CEU : CE->uses())
           Uses.push_back(&CEU);
         PotentialUses = Uses;
