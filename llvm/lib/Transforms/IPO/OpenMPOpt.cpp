@@ -29,6 +29,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -445,6 +446,9 @@ struct OMPInformationCache : public InformationCache {
   EnumeratedArray<InternalControlVarInfo, InternalControlVar,
                   InternalControlVar::ICV___last>
       ICVs;
+
+  /// Functions for which OpenMP-specific AAs have already been registered.
+  DenseSet<const Function *> RegisteredFunctionAAs;
 
   /// Helper to initialize all internal control variable information for those
   /// defined in OMPKinds.def.
@@ -3461,10 +3465,13 @@ struct AAHeapToSharedFunction : public AAHeapToShared {
            bool &) -> std::optional<Value *> { return nullptr; };
 
     Function *F = getAnchorScope();
-    for (User *U : RFI.Declaration->users())
-      if (CallBase *CB = dyn_cast<CallBase>(U)) {
-        if (CB->getFunction() != F)
-          continue;
+    const OMPInformationCache::RuntimeFunctionInfo::UseVector *Uses =
+        RFI.getUseVector(*F);
+    if (!Uses)
+      return;
+
+    for (Use *U : *Uses)
+      if (CallBase *CB = dyn_cast<CallBase>(U->getUser())) {
         MallocCalls.insert(CB);
         A.registerSimplificationCallback(IRPosition::callsite_returned(*CB),
                                          SCB);
@@ -5585,13 +5592,60 @@ void OpenMPOpt::registerAAs(bool IsModulePass) {
 }
 
 void OpenMPOpt::registerAAsForFunction(Attributor &A, const Function &F) {
-  if (!DisableOpenMPOptDeglobalization)
-    A.getOrCreateAAFor<AAHeapToShared>(IRPosition::function(F));
-  A.getOrCreateAAFor<AAExecutionDomain>(IRPosition::function(F));
-  if (!DisableOpenMPOptDeglobalization)
-    A.getOrCreateAAFor<AAHeapToStack>(IRPosition::function(F));
+  auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
+  if (!OMPInfoCache.RegisteredFunctionAAs.insert(&F).second)
+    return;
+
+  IRPosition FPos = IRPosition::function(F);
+  A.getOrCreateAAFor<AAExecutionDomain>(FPos);
   if (F.hasFnAttribute(Attribute::Convergent))
-    A.getOrCreateAAFor<AANonConvergent>(IRPosition::function(F));
+    A.getOrCreateAAFor<AANonConvergent>(FPos);
+
+  if (A.isModulePass()) {
+    A.getOrCreateAAFor<AAIsDead>(FPos);
+    bool IsKnown;
+    if (!AA::hasAssumedIRAttr<Attribute::NoRecurse>(
+            A, nullptr, FPos, DepClassTy::NONE, IsKnown))
+      A.getOrCreateAAFor<AANoRecurse>(FPos);
+    const bool HasPointerArgument =
+        llvm::any_of(F.args(), [](const Argument &Arg) {
+          return Arg.getType()->isPointerTy();
+        });
+    if (HasPointerArgument) {
+      if (!AA::hasAssumedIRAttr<Attribute::NoSync>(
+              A, nullptr, FPos, DepClassTy::NONE, IsKnown))
+        A.getOrCreateAAFor<AANoSync>(FPos);
+      if (!AA::hasAssumedIRAttr<Attribute::NoUnwind>(
+              A, nullptr, FPos, DepClassTy::NONE, IsKnown))
+        A.getOrCreateAAFor<AANoUnwind>(FPos);
+      A.getOrCreateAAFor<AAMemoryBehavior>(FPos);
+    }
+
+    for (const Argument &Arg : F.args()) {
+      IRPosition ArgPos = IRPosition::argument(Arg);
+      if (!Arg.getType()->isPointerTy())
+        continue;
+      if (!llvm::any_of(Arg.uses(), [&](const Use &U) {
+            if (const auto *LI = dyn_cast<LoadInst>(U.getUser()))
+              return LI->getPointerOperand() == &Arg;
+            if (const auto *SI = dyn_cast<StoreInst>(U.getUser()))
+              return SI->getPointerOperand() == &Arg;
+            return false;
+          }))
+        continue;
+      if (!AA::hasAssumedIRAttr<Attribute::Captures>(
+              A, nullptr, ArgPos, DepClassTy::NONE, IsKnown))
+        A.getOrCreateAAFor<AANoCapture>(ArgPos);
+      A.getOrCreateAAFor<AAMemoryBehavior>(ArgPos);
+    }
+  }
+
+  const bool FunctionUsesSharedAlloc =
+      !DisableOpenMPOptDeglobalization &&
+      OMPInfoCache.RFIs[OMPRTL___kmpc_alloc_shared].getUseVector(
+          const_cast<Function &>(F));
+  bool HasHeapToStackCandidate = false;
+  const TargetLibraryInfo *TLI = nullptr;
 
   for (auto &I : instructions(F)) {
     if (auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -5603,6 +5657,12 @@ void OpenMPOpt::registerAAsForFunction(Attributor &A, const Function &F) {
       continue;
     }
     if (auto *CI = dyn_cast<CallBase>(&I)) {
+      if (!DisableOpenMPOptDeglobalization && !HasHeapToStackCandidate) {
+        if (!TLI)
+          TLI = A.getInfoCache().getTargetLibraryInfoForFunction(F);
+        HasHeapToStackCandidate =
+            isRemovableAlloc(CI, TLI) || getFreedOperand(CI, TLI);
+      }
       if (CI->isIndirectCall())
         A.getOrCreateAAFor<AAIndirectCallInfo>(
             IRPosition::callsite_function(*CI));
@@ -5625,6 +5685,11 @@ void OpenMPOpt::registerAAsForFunction(Attributor &A, const Function &F) {
       }
     }
   }
+
+  if (FunctionUsesSharedAlloc)
+    A.getOrCreateAAFor<AAHeapToShared>(FPos);
+  if (!DisableOpenMPOptDeglobalization && HasHeapToStackCandidate)
+    A.getOrCreateAAFor<AAHeapToStack>(FPos);
 }
 
 const char AAICVTracker::ID = 0;
